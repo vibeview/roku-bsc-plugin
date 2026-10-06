@@ -1,0 +1,50 @@
+{
+  "name": "vibeview-bsc-plugin",
+  "version": "0.1.0",
+  "description": "BrighterScript plugin that makes a Roku channel's highlight and test ids visible to VibeView",
+  "keywords": [
+    "brighterscript",
+    "brighterscript-plugin",
+    "bsc",
+    "roku",
+    "scenegraph",
+    "testing",
+    "vibeview"
+  ],
+  "license": "MIT",
+  "author": "VibeView",
+  "homepage": "https://github.com/vibeview/roku-bsc-plugin#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vibeview/roku-bsc-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vibeview/roku-bsc-plugin/issues"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "vibeview-bsc-plugin": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "brighterscript": ">=0.73.0 <0.74.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "brighterscript": "0.73.5",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

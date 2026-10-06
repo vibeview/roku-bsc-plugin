@@ -1,0 +1,62 @@
+# Publishes to npm when a v<version> tag is pushed. The tag comes from the release
+# process that maintains this repository; the version is read from package.json.
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    # npm trusted publishing (OIDC) does not support self-hosted runners.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing: the workflow proves its identity to npm instead of
+      # holding a token. Requires the trusted-publisher entry on the npm package
+      # (repository vibeview/roku-bsc-plugin, workflow publish.yml).
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing needs npm >= 11.5.1. Pin the major: npm 12 needs a newer Node.
+      - run: npm install -g npm@11
+
+      - name: Check the tag matches the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "v${VERSION}" ]; then
+            echo "::error::tag $TAG does not match package.json version $VERSION"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+
+      # Public repository, so npm attaches a provenance statement.
+      - run: npm publish --provenance --access public
+
+      # The registry can serve stale metadata for a few minutes after a publish; fail
+      # the job if the new version never becomes fetchable.
+      - name: Wait until the new version is fetchable
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          for i in $(seq 1 40); do
+            if npm view "vibeview-bsc-plugin@${VERSION}" version --prefer-online >/dev/null 2>&1; then
+              echo "vibeview-bsc-plugin@${VERSION} is fetchable after ~$((i * 15))s"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::vibeview-bsc-plugin@${VERSION} was published but is still not fetchable after 10 minutes"
+          exit 1
