@@ -28,9 +28,34 @@ describe('helperScript', () => {
   it('disabled helper parses cleanly and only has the no-op markup functions', () => {
     const code = helperScript(false);
     expect(diagnosticsFor(code)).toEqual([]);
-    expect(code).toMatch(/sub vibeview_setHighlight\(node as Object, on as Boolean\)\s*end sub/);
-    expect(code).toMatch(/sub vibeview_setId\(node as Object, id as String\)\s*end sub/);
+    expect(code).toMatch(/sub vibeview_setHighlight\(node as Dynamic, on as Dynamic\)\s*end sub/);
+    expect(code).toMatch(/sub vibeview_setId\(node as Dynamic, id as Dynamic\)\s*end sub/);
     expect(code).not.toContain('vibeview_autoMark');
+  });
+  // bsc checks only the argument count of a call, and BrightScript raises a Type Mismatch
+  // crash when an argument does not fit a typed parameter. An app's data (a ParseJSON
+  // number, an invalid) must never crash the channel through the helpers.
+  for (const enabled of [true, false]) {
+    it(`${enabled ? 'enabled' : 'disabled'} helper: public functions take only Dynamic params`, () => {
+      const code = helperScript(enabled);
+      for (const name of ['vibeview_setHighlight', 'vibeview_setId']) {
+        const header = code.match(new RegExp(`sub ${name}\\(([^)]*)\\)`))![1];
+        expect(header.split(',').map((p) => p.trim().split(/\s+as\s+/i)[1])).toEqual([
+          'Dynamic',
+          'Dynamic',
+        ]);
+      }
+    });
+  }
+  it('the enabled helper coerces a numeric id to text and ignores other types', () => {
+    const code = helperScript(true);
+    const fn = code.slice(code.indexOf('function vibeview_idText'));
+    const body = fn.slice(0, fn.indexOf('end function'));
+    expect(body).toContain('ToStr()');
+    expect(body).toMatch(/roFloat|Float/);
+    expect(code).toMatch(
+      /sub vibeview_setId\(node as Dynamic, id as Dynamic\)\s+if Type\(node\) <> "roSGNode" then return\s+idText = vibeview_idText\(id\)/,
+    );
   });
   it('the enabled helper looks markers up among direct children only', () => {
     const code = helperScript(true);

@@ -1,5 +1,5 @@
 {
-  "name": "vibeview-bsc-plugin",
+  "name": "@vibeview/roku-bsc-plugin",
   "version": "0.1.0",
   "description": "BrighterScript plugin that makes a Roku channel's highlight and test ids visible to VibeView",
   "keywords": [
@@ -24,7 +24,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "vibeview-bsc-plugin": "dist/cli.js"
+    "roku-bsc-plugin": "dist/cli.js"
   },
   "files": [
     "dist"

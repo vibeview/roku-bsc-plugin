@@ -11,7 +11,8 @@ import { addHelperTag, addInlineInit, injectIntoInit, stripVibeviewIds } from '.
 import { helperScript, HELPER_PKG_PATH } from './runtime';
 
 const lower = (s: string) => s.replace(/\\/g, '/').toLowerCase();
-const HELPER_KEY = lower(HELPER_PKG_PATH);
+/** Whether a dependency-graph key (or pkgPath) is the helper's, whatever its separators. */
+const isHelperKey = (key: string) => lower(key) === lower(HELPER_PKG_PATH);
 
 function dependencyGraphOf(program: Program): DependencyGraph {
   const graph = (program as unknown as { dependencyGraph?: DependencyGraph }).dependencyGraph;
@@ -24,8 +25,11 @@ export default function vibeviewPlugin(): CompilerPlugin {
   let analysis: Analysis | undefined;
   /** A file was parsed or disposed since the last analysis. */
   let stale = true;
-  /** Dependency-graph keys of components we made depend on the helper. */
-  const wired = new Set<string>();
+  /**
+   * Dependency-graph keys of components we made depend on the helper, each with the helper
+   * key the edge points at (removing an edge needs the exact key it was added with).
+   */
+  const wired = new Map<string, string>();
 
   /**
    * Make each component in `needsHelper` depend on the helper, the same way a `.bs` import
@@ -37,7 +41,7 @@ export default function vibeviewPlugin(): CompilerPlugin {
     const current = program.getFile(HELPER_PKG_PATH);
     const wanted = helperScript(config.enabled, config);
     const importedByHand = Object.values(program.files).some(
-      (f) => isXmlFile(f) && f.scriptTagImports.some((i) => lower(i.pkgPath) === HELPER_KEY),
+      (f) => isXmlFile(f) && f.scriptTagImports.some((i) => isHelperKey(i.pkgPath)),
     );
     if (needsHelper.size === 0 && !importedByHand) {
       // Nobody needs the helper (store build, no markup): ship nothing extra. A hand-written
@@ -50,18 +54,22 @@ export default function vibeviewPlugin(): CompilerPlugin {
     }
     if (needsHelper.size === 0 && wired.size === 0) return;
     const graph = dependencyGraphOf(program);
+    // bsc's own key for the helper: the scope finds a dependency by exact key, and bsc
+    // keys files by their platform pkgPath (backslashes on Windows).
+    const helperKey = program.getFile(HELPER_PKG_PATH)?.dependencyGraphKey;
     for (const file of Object.values(program.files)) {
       if (!isXmlFile(file)) continue;
       const key = file.dependencyGraphKey;
-      if (needsHelper.has(lower(file.pkgPath))) {
+      if (helperKey && needsHelper.has(lower(file.pkgPath))) {
         // Re-parsing a file replaces its graph node, so check the graph, not `wired`.
         // A component that imports the helper by hand already depends on it.
-        if (!file.getOwnDependencies().includes(HELPER_KEY)) {
-          graph.addDependency(key, HELPER_KEY);
-          wired.add(key);
+        if (!file.getOwnDependencies().some(isHelperKey)) {
+          graph.addDependency(key, helperKey);
+          wired.set(key, helperKey);
         }
-      } else if (wired.delete(key)) {
-        graph.removeDependency(key, HELPER_KEY);
+      } else if (wired.has(key)) {
+        graph.removeDependency(key, wired.get(key)!);
+        wired.delete(key);
       }
     }
   }
@@ -95,7 +103,7 @@ export default function vibeviewPlugin(): CompilerPlugin {
   }
 
   return {
-    name: 'vibeview-bsc-plugin',
+    name: '@vibeview/roku-bsc-plugin',
 
     afterProgramCreate(program: Program) {
       // bsc keeps unknown bsconfig keys on the finalized options.
@@ -135,7 +143,7 @@ export default function vibeviewPlugin(): CompilerPlugin {
         // bsc adds the import from the graph edge; if the edge is gone (or could not be
         // added), add the tag ourselves rather than ship a component that calls a missing
         // function. getAllDependencies covers an ancestor that already imports it.
-        if (analysis.needsHelper.has(key) && !file.getAllDependencies().includes(HELPER_KEY)) {
+        if (analysis.needsHelper.has(key) && !file.getAllDependencies().some(isHelperKey)) {
           addHelperTag(file, editor);
         }
         const plan = analysis.plans.get(file.componentName?.text.toLowerCase() ?? '');

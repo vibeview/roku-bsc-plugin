@@ -130,6 +130,38 @@ describe('analyzeProgram', () => {
     expect(a.plans.get('b')?.field).toBe('isActive');
   });
 
+  it("a subclass follows its nearest ancestor's override unless it has its own", () => {
+    const sub = (name: string, parent: string) =>
+      xml(name, `<script type="text/brightscript" uri="${name}.brs" />`, parent);
+    const p = makeProgram({
+      'components/SearchBar.xml': item('SearchBar'),
+      'components/SearchBar.brs': initBrs,
+      'components/SearchBarV2.xml': sub('SearchBarV2', 'SearchBar'),
+      'components/SearchBarV2.brs': initBrs,
+      'components/SearchBarV3.xml': sub('SearchBarV3', 'SearchBarV2'),
+      'components/SearchBarV3.brs': initBrs,
+      'components/PromoTile.xml': xml(
+        'PromoTile',
+        '<interface><field id="isFocused" type="boolean" /><field id="selected" type="boolean" /></interface>\n<script type="text/brightscript" uri="PromoTile.brs" />',
+      ),
+      'components/PromoTile.brs': initBrs,
+      'components/PromoTileWide.xml': sub('PromoTileWide', 'PromoTile'),
+      'components/PromoTileWide.brs': initBrs,
+    });
+    const a = analyzeProgram(
+      p,
+      cfg({
+        enabled: true,
+        highlightFields: ['isFocused'],
+        components: { SearchBar: false, searchbarv3: 'isFocused', PromoTile: 'selected' },
+      }),
+    );
+    expect(a.plans.has('searchbar')).toBe(false);
+    expect(a.plans.has('searchbarv2')).toBe(false);
+    expect(a.plans.get('searchbarv3')?.field).toBe('isFocused');
+    expect(a.plans.get('promotilewide')?.field).toBe('selected');
+  });
+
   it('warns when an override names a missing field', () => {
     const p = makeProgram({ 'components/B.xml': item('B'), 'components/B.brs': initBrs });
     analyzeProgram(p, cfg({ enabled: true, components: { B: 'nope' } }));
@@ -153,6 +185,55 @@ describe('analyzeProgram', () => {
     // Base gets the helper; Child inherits it, so it is not added twice.
     expect(a.needsHelper.has('components/base.xml')).toBe(true);
     expect(a.needsHelper.has('components/child.xml')).toBe(false);
+  });
+
+  it("a subclass inherits its ancestors' vibeviewId ids", () => {
+    const parent = xml(
+      'Parent',
+      '<script type="text/brightscript" uri="Parent.brs" />\n<children><Poster id="icon" vibeviewId="nav-icon" /></children>',
+    );
+    const p = makeProgram({
+      'components/Parent.xml': parent,
+      'components/Parent.brs': initBrs,
+      // No script of its own: runs Parent's init with subtype() "Child".
+      'components/Child.xml': xml('Child', '', 'Parent'),
+      // Its own field, init and id.
+      'components/Child2.xml': xml(
+        'Child2',
+        '<interface><field id="isFocused" type="boolean" /></interface>\n<script type="text/brightscript" uri="Child2.brs" />\n<children><Label id="title" vibeviewId="t" /></children>',
+        'Parent',
+      ),
+      'components/Child2.brs': initBrs,
+      'components/Grand.xml': xml(
+        'Grand',
+        '<children><Label id="icon2" vibeviewId="x" /></children>',
+        'Child2',
+      ),
+    });
+    const a = analyzeProgram(p, cfg({ enabled: true, highlightFields: ['isFocused'] }));
+    expect(a.initTables.get('components/parent.brs')).toEqual({
+      Child: { ids: [['icon', 'nav-icon']] },
+      Parent: { ids: [['icon', 'nav-icon']] },
+    });
+    expect(a.initTables.get('components/child2.brs')).toEqual({
+      Child2: {
+        field: 'isFocused',
+        ids: [
+          ['icon', 'nav-icon'],
+          ['title', 't'],
+        ],
+      },
+      Grand: {
+        field: 'isFocused',
+        ids: [
+          ['icon', 'nav-icon'],
+          ['title', 't'],
+          ['icon2', 'x'],
+        ],
+      },
+    });
+    // Ids are stripped only from the XML that declares them; errors are not repeated.
+    expect(a.stripIds.has('components/child.xml')).toBe(false);
   });
 
   it('a child without its own init() is keyed into the init() it inherits', () => {
@@ -184,6 +265,33 @@ describe('analyzeProgram', () => {
       A: { field: 'isFocused' },
       B: { field: 'isFocused' },
     });
+  });
+
+  it("a .d.bs typedef's init() is mapped to the .brs file that implements it", () => {
+    const p = makeProgram({
+      'components/Nav.xml': item('Nav'),
+      'components/Nav.brs': 'sub init()\n    print "x"\nend sub\n',
+      'components/Nav.d.bs': 'sub init()\nend sub\n',
+    });
+    const a = analyzeProgram(p, cfg({ enabled: true, highlightFields: ['isFocused'] }));
+    expect(a.plans.get('nav')?.initPkgPath).toBe('components/nav.brs');
+    expect([...a.initTables.keys()]).toEqual(['components/nav.brs']);
+  });
+
+  it('a typedef init() with no implementation in the project skips the component', () => {
+    const p = makeProgram({
+      'components/Lib.xml': xml(
+        'Lib',
+        '<interface><field id="isFocused" type="boolean" /></interface>\n<script type="text/brightscript" uri="Lib.d.bs" />',
+      ),
+      'components/Lib.d.bs': 'sub init()\nend sub\n',
+    });
+    const a = analyzeProgram(p, cfg({ enabled: true, highlightFields: ['isFocused'] }));
+    expect(a.plans.has('lib')).toBe(false);
+    expect(a.initTables.size).toBe(0);
+    expect(diags(p)).toContain(
+      'vibeview: Lib: its init() is declared only in a .d.bs typedef; the file that implements it is not in the project (skipped)',
+    );
   });
 
   it('no init() anywhere leaves initPkgPath undefined', () => {
@@ -298,5 +406,163 @@ describe('analyzeProgram', () => {
       'components/b.xml',
       'components/base.xml',
     ]);
+  });
+
+  describe('marker vs child indexing', () => {
+    const focusable = (name: string, children = '') =>
+      xml(
+        name,
+        `<interface><field id="isFocused" type="boolean" /></interface>\n<script type="text/brightscript" uri="${name}.brs" />${children}`,
+      );
+    const plain = (name: string, children = '') =>
+      xml(name, `<script type="text/brightscript" uri="${name}.brs" />${children}`);
+    const warnings = (files: Record<string, string>, enabled = true) => {
+      const p = makeProgram(files);
+      analyzeProgram(p, cfg({ enabled, highlightFields: ['isFocused'] }));
+      return p
+        .getDiagnostics()
+        .filter((d) => d.code === 'vibeview' && d.severity === 2)
+        .map(text)
+        .filter((m) => m.includes('children'));
+    };
+
+    it('warns when a field-marked component indexes m.top (getChild, getChildCount)', () => {
+      const w = warnings({
+        'components/Top.xml': focusable('Top'),
+        'components/Top.brs':
+          'sub init()\n    m.top.getChild(m.top.getChildCount() - 1)\nend sub\n',
+      });
+      expect(w).toEqual([expect.stringMatching(/^vibeview: Top: .*m\.top/)]);
+    });
+
+    it('warns for getChildren on m.top', () => {
+      const w = warnings({
+        'components/Tile.xml': focusable('Tile'),
+        'components/Tile.brs':
+          'sub init()\n    for each c in m.top.getChildren(-1, 0)\n        c.opacity = 0.5\n    end for\nend sub\n',
+      });
+      expect(w).toEqual([expect.stringMatching(/^vibeview: Tile: .*m\.top/)]);
+    });
+
+    it('warns when a vibeviewId element is indexed through the variable holding it', () => {
+      const w = warnings({
+        'components/Menu.xml': plain(
+          'Menu',
+          '<children><LayoutGroup id="menu" vibeviewId="main-menu"><Label id="a" /></LayoutGroup></children>',
+        ),
+        'components/Menu.brs':
+          'sub init()\n    m.menu = m.top.findNode("menu")\n    m.menu.getChild(m.menu.getChildCount() - 1).setFocus(true)\nend sub\n',
+      });
+      expect(w).toEqual([expect.stringMatching(/^vibeview: Menu: .*m\.menu/)]);
+    });
+
+    it('warns when a vibeviewId element is indexed through findNode directly', () => {
+      const w = warnings({
+        'components/Menu.xml': plain(
+          'Menu',
+          '<children><LayoutGroup id="menu" vibeviewId="main-menu"><Label id="a" /></LayoutGroup></children>',
+        ),
+        'components/Menu.brs':
+          'sub init()\n    m.top.findNode("menu").getChildren(-1, 0)\nend sub\n',
+      });
+      expect(w).toHaveLength(1);
+    });
+
+    it('warns when a node passed to the helpers by hand is indexed', () => {
+      const w = warnings({
+        'components/Hand.xml': plain('Hand'),
+        'components/Hand.brs':
+          'sub init()\n    vibeview_setId(m.top, "hand")\n    m.top.getChild(m.top.getChildCount() - 1).setFocus(true)\nend sub\n',
+        'components/Row.xml': plain('Row'),
+        'components/Row.brs':
+          'sub init()\n    m.row = m.top.findNode("row")\n    vibeview_setHighlight(m.row, true)\n    first = m.row.getChild(0)\nend sub\n',
+      });
+      expect(w).toEqual([
+        expect.stringMatching(/^vibeview: Hand: .*m\.top/),
+        expect.stringMatching(/^vibeview: Row: .*m\.row/),
+      ]);
+    });
+
+    it('stays quiet for nodes that get no marker, comments and store builds', () => {
+      const files = {
+        // ids only: m.top itself gets no marker.
+        'components/Ids.xml': plain(
+          'Ids',
+          '<children><Poster id="p" vibeviewId="poster" /></children>',
+        ),
+        'components/Ids.brs': 'sub init()\n    m.top.getChild(0)\nend sub\n',
+        // marked by a field, but indexes another node.
+        'components/List.xml': focusable('List'),
+        'components/List.brs':
+          'sub init()\n    m.list = m.top.findNode("list")\n    m.list.getChild(0)\nend sub\n',
+        // only a comment indexes m.top.
+        'components/Quiet.xml': focusable('Quiet'),
+        'components/Quiet.brs':
+          'sub init()\n    \' m.top.getChild(0)\n    m.x = "m.top.getChild(" \' too\nend sub\n',
+      };
+      expect(warnings(files)).toEqual([]);
+      expect(
+        warnings(
+          {
+            'components/Top.xml': focusable('Top'),
+            'components/Top.brs': 'sub init()\n    m.top.getChild(0)\nend sub\n',
+          },
+          false,
+        ),
+      ).toEqual([]);
+    });
+  });
+
+  describe('list items with no highlight field', () => {
+    const itemXml = (name: string, fields: string) =>
+      xml(
+        name,
+        `<interface>${fields}</interface>\n<script type="text/brightscript" uri="${name}.brs" />`,
+      );
+    const files = {
+      'components/Screen.xml': xml(
+        'Screen',
+        '<script type="text/brightscript" uri="Screen.brs" />\n<children><RowList id="rows" itemComponentName="RowItem" /><MarkupGrid id="grid2" itemComponentName="RowItem2" /></children>',
+      ),
+      'components/Screen.brs':
+        'sub init()\n    m.grid = m.top.findNode("grid")\n    m.grid.itemComponentName = "Cell"\nend sub\n',
+      'components/RowItem.xml': itemXml(
+        'RowItem',
+        '<field id="itemContent" type="node" /><field id="focusPercent" type="float" /><field id="rowListHasFocus" type="boolean" />',
+      ),
+      'components/RowItem.brs': initBrs,
+      'components/RowItem2.xml': itemXml(
+        'RowItem2',
+        '<field id="itemContent" type="node" /><field id="itemHasFocus" type="boolean" />',
+      ),
+      'components/RowItem2.brs': initBrs,
+      'components/Cell.xml': itemXml('Cell', '<field id="label" type="string" />'),
+      'components/Cell.brs': initBrs,
+      'components/Card.xml': itemXml('Card', '<field id="itemContent" type="node" />'),
+      'components/Card.brs': initBrs,
+      'components/Panel.xml': itemXml('Panel', '<field id="title" type="string" />'),
+      'components/Panel.brs': initBrs,
+    };
+    const notes = (enabled: boolean) => {
+      const p = makeProgram(files);
+      analyzeProgram(p, cfg({ enabled }));
+      return p
+        .getDiagnostics()
+        .filter((d) => d.code === 'vibeview' && d.severity === 3)
+        .map(text)
+        .filter((m) => m.includes('no highlight field'));
+    };
+
+    it('notes each list item component, or itemContent holder, that declares no highlight field', () => {
+      expect(notes(true).sort()).toEqual([
+        'vibeview: Card: holds itemContent but declares no highlight field (itemHasFocus); it is not marked. If a list uses it, declare <field id="itemHasFocus" type="boolean" /> so the list sets it',
+        'vibeview: Cell: list item component declares no highlight field (itemHasFocus); it is not marked. Declare <field id="itemHasFocus" type="boolean" /> so the list sets it',
+        'vibeview: RowItem: list item component declares no highlight field (itemHasFocus); it is not marked. Declare <field id="itemHasFocus" type="boolean" /> so the list sets it',
+      ]);
+    });
+
+    it('says nothing when markers are off', () => {
+      expect(notes(false)).toEqual([]);
+    });
   });
 });

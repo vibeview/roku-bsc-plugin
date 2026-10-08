@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { runInit } from './init';
 
-const USAGE = `Usage: vibeview-bsc-plugin init [--force]
+const USAGE = `Usage: npx @vibeview/roku-bsc-plugin init [--force]
 
 Adds the plugin to ./bsconfig.json and writes a "vibeview" block (markers off, Roku's
 native list-item fields spelled out). Creates the file if it is missing. Refuses to

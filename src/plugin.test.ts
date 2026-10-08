@@ -70,7 +70,7 @@ const project = {
   'components/Plain.brs': PLAIN_BRS,
 };
 
-describe('vibeview-bsc-plugin', () => {
+describe('@vibeview/roku-bsc-plugin', () => {
   it('enabled: injects autoMark into init(), adds the helper tag, strips vibeviewId', async () => {
     const { read } = await build(project, { enabled: true, highlightFields: ['isFocused'] });
     expect(read('components/NavItem.brs')).toMatch(
@@ -348,6 +348,48 @@ describe('vibeview-bsc-plugin', () => {
     expect(read('components/NavItem.brs')).toBe(NAV_BRS);
     expect(read('components/NavItem.xml')).not.toContain('vibeviewId');
     expect(read('components/Plain.xml')).toContain(HELPER_TAG);
+  });
+
+  // On Windows bsc keys every file (pkgMap and dependency graph) by a backslash pkgPath,
+  // components\\vibeview\\vibeview.brs, and its path lookups standardize to backslashes.
+  // Simulate that for the helper on any OS: re-key it in pkgMap and the graph, and let
+  // program.getFile find it by the forward-slash path as a Windows standardizePath would.
+  const FWD = 'components/vibeview/vibeview.brs';
+  const BACK = 'components\\vibeview\\vibeview.brs';
+  const windowsKeys: Plugin = {
+    name: 'windows-keys',
+    afterProgramCreate(program: Program) {
+      const getFile = program.getFile.bind(program);
+      program.getFile = ((p: string, normalize?: boolean) =>
+        typeof p === 'string' && p.replace(/\\/g, '/').toLowerCase() === FWD
+          ? getFile(BACK, false)
+          : getFile(p, normalize)) as never;
+    },
+    afterFileParse(file) {
+      if (file.pkgPath.toLowerCase() !== FWD) return;
+      const pkgMap = (file.program as unknown as { pkgMap: Record<string, unknown> }).pkgMap;
+      delete pkgMap[FWD];
+      pkgMap[BACK] = file;
+      (file as unknown as { dependencyGraphKey: string }).dependencyGraphKey = BACK;
+    },
+    afterFileDispose(file) {
+      const pkgMap = (file.program as unknown as { pkgMap: Record<string, unknown> }).pkgMap;
+      if (pkgMap[BACK] === file) delete pkgMap[BACK];
+    },
+  };
+
+  it('wires the helper by its own dependency-graph key (Windows backslash keys)', async () => {
+    const files = {
+      ...project,
+      'components/Plain.brs': 'sub init()\n    vibeview_setId(m.top, "plain")\nend sub\n',
+    };
+    for (const enabled of [true, false]) {
+      const { read, diagnostics } = await build(files, { enabled }, { before: [windowsKeys] });
+      const codes = diagnostics.map((d) => d.code);
+      expect(codes).not.toContain(1140); // cannot find function
+      expect(codes).not.toContain(1013); // helper not referenced
+      expect(read('components/Plain.xml')).toContain(HELPER_TAG);
+    }
   });
 
   it('enabled build writes the configured id/label lists into the helper', async () => {

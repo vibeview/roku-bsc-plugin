@@ -41,7 +41,6 @@ const ID_RE = /^[A-Za-z0-9_.-]+$/;
 /** SceneGraph accepts both spellings for a boolean interface field. */
 const BOOLEAN_TYPES = new Set(['boolean', 'bool']);
 const CALLS_HELPER = /\bvibeview_set(Highlight|Id)\s*\(/i;
-const INDEXES_TOP_CHILDREN = /m\.top\.getChild(Count)?\s*\(/i;
 const lower = (s: string) => s.replace(/\\/g, '/').toLowerCase();
 const isHelper = (file: BscFile) => lower(file.pkgPath) === lower(HELPER_PKG_PATH);
 
@@ -74,14 +73,29 @@ function findField(
   return undefined;
 }
 
-function overrideFor(config: VibeviewConfig, name: string): string | false | undefined {
+function ownOverride(config: VibeviewConfig, name: string): string | false | undefined {
   if (name in config.components) return config.components[name];
   const key = Object.keys(config.components).find((k) => k.toLowerCase() === name.toLowerCase());
   return key === undefined ? undefined : config.components[key];
 }
 
+/**
+ * The component's own `components` entry, else its nearest ancestor's: a subclass inherits
+ * the field, and so whatever the override says about it.
+ */
+function overrideFor(file: XmlFile, config: VibeviewConfig): string | false | undefined {
+  const seen = new Set<XmlFile>();
+  for (let f: XmlFile | undefined = file; f && !seen.has(f); f = f.parentComponent) {
+    seen.add(f);
+    const name = f.componentName?.text;
+    const override = name ? ownOverride(config, name) : undefined;
+    if (override !== undefined) return override;
+  }
+  return undefined;
+}
+
 function chooseField(file: XmlFile, name: string, config: VibeviewConfig): string | undefined {
-  const override = overrideFor(config, name);
+  const override = overrideFor(file, config);
   if (override === false) return undefined;
   if (typeof override === 'string') {
     const found = findField(file, override);
@@ -149,6 +163,106 @@ function collectIds(file: XmlFile): [string, string][] {
   return ids;
 }
 
+/**
+ * BrightScript code without comments (`'` and `rem`). A string literal keeps its text only
+ * when it could be a node id (`findNode("menu")`); any other is emptied, so code quoted in
+ * a string never reads as a call.
+ */
+function codeOnly(code: string): string {
+  return code
+    .split(/\r?\n/)
+    .map((line) => {
+      if (/^\s*rem\b/i.test(line)) return '';
+      let out = '';
+      for (let i = 0; i < line.length; i++) {
+        if (line[i] === "'") break;
+        if (line[i] !== '"') {
+          out += line[i];
+          continue;
+        }
+        // A string runs to the next quote; "" inside it is an escaped quote.
+        let j = i + 1;
+        while (j < line.length && (line[j] !== '"' || line[j + 1] === '"')) {
+          j += line[j] === '"' ? 2 : 1;
+        }
+        const text = line.slice(i + 1, j);
+        out += /^[\w.-]*$/.test(text) ? `"${text}"` : '""';
+        i = j;
+      }
+      return out;
+    })
+    .join('\n');
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** `<expr>.getChild(`, `.getChildCount(` or `.getChildren(`, with `expr` not a longer name's tail. */
+const indexes = (code: string, expr: string) =>
+  new RegExp(`(?<![\\w.])${expr}\\s*\\.\\s*getChild(?:Count|ren)?\\s*\\(`, 'i').test(code);
+const findNodeRe = (nodeId: string) =>
+  `m\\.top\\s*\\.\\s*findNode\\s*\\(\\s*"${escapeRe(nodeId)}"\\s*\\)`;
+const LVALUE = '[A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)*';
+const HELPER_TARGET = new RegExp(
+  `\\bvibeview_set(?:Highlight|Id)\\s*\\(\\s*(${LVALUE}(?:\\s*\\.\\s*findNode\\s*\\(\\s*"[^"]*"\\s*\\))?)\\s*,`,
+  'gi',
+);
+
+/**
+ * The nodes that get a marker child, as the component's scripts name them, whose children
+ * those scripts index (`getChild`, `getChildCount`, `getChildren`): `m.top` when the
+ * component is marked by a field or passes `m.top` to a helper; an element with a
+ * vibeviewId, through `m.top.findNode("<id>")` or a variable assigned from it; and any
+ * other variable the scripts pass to a helper. A node reached another way is not seen.
+ */
+function indexedMarkedNodes(code: string, markTop: boolean, nodeIds: string[]): string[] {
+  const found: string[] = [];
+  const ids = new Set(nodeIds);
+  const targets = new Set<string>();
+  for (const [, arg] of code.matchAll(HELPER_TARGET)) {
+    const compact = arg.replace(/\s+/g, '');
+    const byId = /^m\.top\.findNode\("([^"]*)"\)$/i.exec(compact);
+    if (byId) ids.add(byId[1]);
+    else targets.add(compact);
+  }
+  if (
+    (markTop || [...targets].some((t) => t.toLowerCase() === 'm.top')) &&
+    indexes(code, 'm\\.top')
+  ) {
+    found.push('m.top');
+  }
+  for (const nodeId of ids) {
+    const direct = findNodeRe(nodeId);
+    if (indexes(code, direct)) found.push(`m.top.findNode("${nodeId}")`);
+    const assigned = new RegExp(`(?<![\\w.])(${LVALUE})\\s*=\\s*${direct}`, 'gi');
+    for (const [, lvalue] of code.matchAll(assigned)) targets.add(lvalue);
+  }
+  for (const target of targets) {
+    if (target.toLowerCase() === 'm.top') continue;
+    const expr = target.split('.').map(escapeRe).join('\\s*\\.\\s*');
+    if (indexes(code, expr) && !found.includes(target)) found.push(target);
+  }
+  return found;
+}
+
+/**
+ * The component's ids with its ancestors': a subclass instance holds its ancestors' child
+ * nodes too, and runs autoMark with its own subtype(). Root ancestor first; when two
+ * declare the same node id, the nearest one's test id wins.
+ */
+function inheritedIds(file: XmlFile, ownIds: Map<XmlFile, [string, string][]>): [string, string][] {
+  const chain: XmlFile[] = [];
+  for (let f: XmlFile | undefined = file; f && !chain.includes(f); f = f.parentComponent) {
+    chain.unshift(f);
+  }
+  const byNode = new Map<string, string>();
+  for (const f of chain) {
+    for (const [nodeId, testId] of ownIds.get(f) ?? []) {
+      byNode.delete(nodeId);
+      byNode.set(nodeId, testId);
+    }
+  }
+  return [...byNode];
+}
+
 const hasInlineCode = (file: XmlFile) =>
   (file.ast.component?.scripts ?? []).some((s) => !s.uri && !!s.cdata?.text.trim());
 
@@ -196,6 +310,83 @@ function reportEffectiveLists(file: XmlFile, config: VibeviewConfig) {
   }
 }
 
+/**
+ * Names (lower-cased) of components a Roku list uses as its items: an `itemComponentName`
+ * attribute in any component's XML, or a quoted name assigned to it in a script
+ * (`.itemComponentName = "X"`, `itemComponentName: "X"`, `setField("itemComponentName", "X")`).
+ */
+function listItemComponents(files: BscFile[]): Set<string> {
+  const names = new Set<string>();
+  const visit = (nodes: SGNode[] | undefined) => {
+    for (const node of nodes ?? []) {
+      const value = node.getAttributeValue('itemComponentName');
+      if (value) names.add(value.toLowerCase());
+      visit(node.children);
+    }
+  };
+  const assigned = /\bitemComponentName"?\s*[:=,]\s*"([\w.-]+)"/gi;
+  for (const file of files) {
+    if (isXmlFile(file)) visit(file.ast.component?.children?.children);
+    else if (isBrsFile(file) && !isHelper(file)) {
+      for (const [, name] of codeOnly(file.fileContents ?? '').matchAll(assigned)) {
+        names.add(name.toLowerCase());
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * Roku sets `itemHasFocus` only on an item component that declares it, so a list item
+ * without a highlight field is silently left unmarked. Say so, for a component a list
+ * uses as its items or, failing that, one that holds `itemContent`.
+ */
+function noteUnmarkedListItem(
+  file: XmlFile,
+  name: string,
+  config: VibeviewConfig,
+  listItems: Set<string>,
+) {
+  if (overrideFor(file, config) === false) return;
+  const fields = config.highlightFields.join(', ');
+  const field = '<field id="itemHasFocus" type="boolean" /> so the list sets it';
+  let message: string | undefined;
+  if (listItems.has(name.toLowerCase())) {
+    message = `list item component declares no highlight field (${fields}); it is not marked. Declare ${field}`;
+  } else if (findField(file, 'itemContent')) {
+    message = `holds itemContent but declares no highlight field (${fields}); it is not marked. If a list uses it, declare ${field}`;
+  }
+  if (message) {
+    report(file, `${name}: ${message}`, DiagnosticSeverity.Information, file.componentName?.range);
+  }
+}
+
+/** Warn when the component's scripts index the children of a node that gets a marker. */
+function warnIndexedMarkers(
+  file: XmlFile,
+  name: string,
+  scopeFiles: BscFile[],
+  field: string | undefined,
+  ids: [string, string][],
+) {
+  const code = scopeFiles
+    .filter((f) => isBrsFile(f) && !isHelper(f))
+    .map((f) => codeOnly(f.fileContents ?? ''))
+    .join('\n');
+  const nodes = indexedMarkedNodes(
+    code,
+    !!field,
+    ids.map(([nodeId]) => nodeId),
+  );
+  if (nodes.length === 0) return;
+  report(
+    file,
+    `${name}: its scripts index the children of ${nodes.join(', ')} (getChild/getChildCount/getChildren); the marker is added there as the last child`,
+    DiagnosticSeverity.Warning,
+    file.componentName?.range,
+  );
+}
+
 export function analyzeProgram(program: Program, config: VibeviewConfig): Analysis {
   const analysis: Analysis = {
     plans: new Map(),
@@ -232,15 +423,22 @@ export function analyzeProgram(program: Program, config: VibeviewConfig): Analys
     .filter((f) => !!f.componentName?.text)
     .sort((a, b) => (lower(a.pkgPath) < lower(b.pkgPath) ? -1 : 1));
   if (config.enabled && xmlFiles.length > 0) reportEffectiveLists(xmlFiles[0], config);
+  const listItems = config.enabled ? listItemComponents(files) : new Set<string>();
   const helperWanted = new Set<string>();
   const scopeFilesByName = new Map<string, BscFile[]>();
 
+  // Each XML's own ids, checked (and reported) once.
+  const ownIds = new Map<XmlFile, [string, string][]>();
   for (const file of xmlFiles) {
-    const name = file.componentName.text;
-    const ids = collectIds(file);
-    if (ids.length > 0 || /vibeviewId\s*=/i.test(file.fileContents ?? '')) {
+    ownIds.set(file, collectIds(file));
+    if (ownIds.get(file)!.length > 0 || /vibeviewId\s*=/i.test(file.fileContents ?? '')) {
       analysis.stripIds.add(lower(file.pkgPath));
     }
+  }
+
+  for (const file of xmlFiles) {
+    const name = file.componentName.text;
+    const ids = inheritedIds(file, ownIds);
 
     const scope = program.getComponentScope(name);
     const scopeFiles = (scope?.getAllFiles() ?? []) as BscFile[];
@@ -251,6 +449,17 @@ export function analyzeProgram(program: Program, config: VibeviewConfig): Analys
     if (!config.enabled) continue;
 
     const field = chooseField(file, name, config);
+    // Markers come from the field and ids unless the component is skipped below; nodes
+    // passed to the helpers by hand get one either way.
+    const autoMarked = (!!field || ids.length > 0) && !hasInlineCode(file);
+    warnIndexedMarkers(
+      file,
+      name,
+      scopeFiles,
+      autoMarked ? field : undefined,
+      autoMarked ? ids : [],
+    );
+    if (!field) noteUnmarkedListItem(file, name, config, listItems);
     if (!field && ids.length === 0) continue;
     if (hasInlineCode(file)) {
       report(
@@ -261,8 +470,23 @@ export function analyzeProgram(program: Program, config: VibeviewConfig): Analys
       );
       continue;
     }
-    const init = resolveInit(scope);
-    const initPkgPath = init ? lower(init.file.pkgPath) : undefined;
+    let initFile = resolveInit(scope)?.file;
+    if (initFile && isBrsFile(initFile) && initFile.isTypedef) {
+      // With X.d.bs in the program bsc puts its callables in scope instead of X.brs's;
+      // the code that runs, and so gets the call, is X.brs (or X.bs).
+      const base = initFile.pkgPath.replace(/\.d\.bs$/i, '');
+      initFile = program.getFile(`${base}.brs`) ?? program.getFile(`${base}.bs`);
+      if (!initFile) {
+        report(
+          file,
+          `${name}: its init() is declared only in a .d.bs typedef; the file that implements it is not in the project (skipped)`,
+          DiagnosticSeverity.Warning,
+          file.componentName.range,
+        );
+        continue;
+      }
+    }
+    const initPkgPath = initFile ? lower(initFile.pkgPath) : undefined;
     const plan: ComponentPlan = {
       name,
       xmlPkgPath: lower(file.pkgPath),
@@ -276,14 +500,6 @@ export function analyzeProgram(program: Program, config: VibeviewConfig): Analys
       const table = analysis.initTables.get(initPkgPath) ?? {};
       table[name] = { ...(field ? { field } : {}), ...(ids.length ? { ids } : {}) };
       analysis.initTables.set(initPkgPath, table);
-    }
-    if (scopeFiles.some((f) => !isHelper(f) && INDEXES_TOP_CHILDREN.test(f.fileContents ?? ''))) {
-      report(
-        file,
-        `${name}: its scripts index m.top's children; the marker is appended as the last child`,
-        DiagnosticSeverity.Warning,
-        file.componentName.range,
-      );
     }
     report(
       file,
