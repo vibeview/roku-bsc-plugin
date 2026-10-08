@@ -52,11 +52,11 @@ jobs:
         run: |
           VERSION=$(node -p "require('./package.json').version")
           for i in $(seq 1 40); do
-            if npm view "vibeview-bsc-plugin@${VERSION}" version --prefer-online >/dev/null 2>&1; then
-              echo "vibeview-bsc-plugin@${VERSION} is fetchable after ~$((i * 15))s"
+            if npm view "@vibeview/roku-bsc-plugin@${VERSION}" version --prefer-online >/dev/null 2>&1; then
+              echo "@vibeview/roku-bsc-plugin@${VERSION} is fetchable after ~$((i * 15))s"
               exit 0
             fi
             sleep 15
           done
-          echo "::error::vibeview-bsc-plugin@${VERSION} was published but is still not fetchable after 10 minutes"
+          echo "::error::@vibeview/roku-bsc-plugin@${VERSION} was published but is still not fetchable after 10 minutes"
           exit 1
