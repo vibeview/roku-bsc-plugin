@@ -304,56 +304,6 @@ describe('@vibeview/roku-bsc-plugin', () => {
     });
   }
 
-  const breaker: Plugin = {
-    name: 'breaker',
-    afterProgramCreate(program: Program) {
-      const graph = (
-        program as unknown as {
-          dependencyGraph: { addDependency: (key: string, dep: string) => void };
-        }
-      ).dependencyGraph;
-      const add = graph.addDependency.bind(graph);
-      graph.addDependency = (key: string, dep: string) => {
-        if (dep === 'components/vibeview/vibeview.brs') throw new Error('boom');
-        return add(key, dep);
-      };
-    },
-  };
-  const callerProject = {
-    ...project,
-    'components/Plain.brs': 'sub init()\n    vibeview_setId(m.top, "plain")\nend sub\n',
-  };
-  const errorsOf = (diagnostics: { severity?: number; message: unknown }[]) =>
-    diagnostics.filter((d) => d.severity === 1).map((d) => String(d.message));
-
-  it('if the helper cannot be wired in, a validated build fails with an error', async () => {
-    const { read, diagnostics } = await build(
-      callerProject,
-      { enabled: true },
-      { before: [breaker] },
-    );
-    expect(errorsOf(diagnostics).some((m) => m.startsWith('vibeview:') && m.includes('boom'))).toBe(
-      true,
-    );
-    expect(read('components/NavItem.brs')).toBeNull(); // bsc stops before staging
-  });
-
-  it('if the helper cannot be wired in (validate: false), no markers ship and callers keep the import', async () => {
-    const { read, diagnostics } = await build(
-      callerProject,
-      { enabled: true },
-      { before: [breaker], options: { validate: false } },
-    );
-    expect(errorsOf(diagnostics).some((m) => m.includes('boom'))).toBe(true);
-    expect(read('components/NavItem.brs')).toBe(NAV_BRS);
-    expect(read('components/NavItem.xml')).not.toContain('vibeviewId');
-    expect(read('components/Plain.xml')).toContain(HELPER_TAG);
-  });
-
-  // On Windows bsc keys every file (pkgMap and dependency graph) by a backslash pkgPath,
-  // components\\vibeview\\vibeview.brs, and its path lookups standardize to backslashes.
-  // Simulate that for the helper on any OS: re-key it in pkgMap and the graph, and let
-  // program.getFile find it by the forward-slash path as a Windows standardizePath would.
   const FWD = 'components/vibeview/vibeview.brs';
   const BACK = 'components\\vibeview\\vibeview.brs';
   const windowsKeys: Plugin = {
@@ -377,6 +327,70 @@ describe('@vibeview/roku-bsc-plugin', () => {
       if (pkgMap[BACK] === file) delete pkgMap[BACK];
     },
   };
+
+  const breaker: Plugin = {
+    name: 'breaker',
+    afterProgramCreate(program: Program) {
+      const graph = (
+        program as unknown as {
+          dependencyGraph: { addDependency: (key: string, dep: string) => void };
+        }
+      ).dependencyGraph;
+      const add = graph.addDependency.bind(graph);
+      graph.addDependency = (key: string, dep: string) => {
+        // The helper's own graph key: backslashes on Windows.
+        if (dep.replace(/\\/g, '/').toLowerCase() === FWD) throw new Error('boom');
+        return add(key, dep);
+      };
+    },
+  };
+  const callerProject = {
+    ...project,
+    'components/Plain.brs': 'sub init()\n    vibeview_setId(m.top, "plain")\nend sub\n',
+  };
+  const errorsOf = (diagnostics: { severity?: number; message: unknown }[]) =>
+    diagnostics.filter((d) => d.severity === 1).map((d) => String(d.message));
+
+  // Both key styles: on Windows the helper's dependency-graph key has backslashes.
+  const keyStyles = (): [string, Plugin[]][] => [
+    ['posix keys', []],
+    ['Windows keys', [windowsKeys]],
+  ];
+
+  it.each(keyStyles())(
+    'if the helper cannot be wired in, a validated build fails with an error (%s)',
+    async (_, keys) => {
+      const { read, diagnostics } = await build(
+        callerProject,
+        { enabled: true },
+        { before: [...keys, breaker] },
+      );
+      expect(
+        errorsOf(diagnostics).some((m) => m.startsWith('vibeview:') && m.includes('boom')),
+      ).toBe(true);
+      expect(read('components/NavItem.brs')).toBeNull(); // bsc stops before staging
+    },
+  );
+
+  it.each(keyStyles())(
+    'if the helper cannot be wired in (validate: false), no markers ship and callers keep the import (%s)',
+    async (_, keys) => {
+      const { read, diagnostics } = await build(
+        callerProject,
+        { enabled: true },
+        { before: [...keys, breaker], options: { validate: false } },
+      );
+      expect(errorsOf(diagnostics).some((m) => m.includes('boom'))).toBe(true);
+      expect(read('components/NavItem.brs')).toBe(NAV_BRS);
+      expect(read('components/NavItem.xml')).not.toContain('vibeviewId');
+      expect(read('components/Plain.xml')).toContain(HELPER_TAG);
+    },
+  );
+
+  // On Windows bsc keys every file (pkgMap and dependency graph) by a backslash pkgPath,
+  // components\\vibeview\\vibeview.brs, and its path lookups standardize to backslashes.
+  // Simulate that for the helper on any OS: re-key it in pkgMap and the graph, and let
+  // program.getFile find it by the forward-slash path as a Windows standardizePath would.
 
   it('wires the helper by its own dependency-graph key (Windows backslash keys)', async () => {
     const files = {
